@@ -163,193 +163,190 @@ const parseThenWalk = (source, counts) => {
 
 // ---------------------------------------------------------------------
 // Pattern 3: single-pass class (lexer + builder + visitor in one loop).
+//
+// Reuses the public `walkCssTokens` parse helpers (`parseAtRule`,
+// `parseADeclaration`, `parseAListOfComponentValues`) for the
+// individual rule / declaration heads, and drives body recursion
+// itself — so the prelude/declaration parsing keeps the spec-correct
+// helpers (we don't fork their grammar) but the *outer* loop only
+// visits each byte once. The double parse the lazy walker pays
+// (`parseAStylesheet` builds the full tree, then `parseABlocksContents`
+// re-parses each body to walk it) is gone.
 // ---------------------------------------------------------------------
 
-const T_TOP = 0;
-const T_PRELUDE = 1;
-const T_BLOCK = 2;
-const T_DECL_VALUE = 3;
+const CC_AT_SIGN = "@".charCodeAt(0);
+const CC_SEMICOLON_OPP = ";".charCodeAt(0);
+const CC_RIGHT_CURLY_OPP = "}".charCodeAt(0);
 
 /**
- * One-pass CSS parser: drives `walkCssTokens` directly and emits
- * visitor events at the rule / at-rule / declaration boundaries it
- * recognizes, *without* materializing intermediate AST nodes. The
- * `Frame` stack tracks the nesting context (top level vs in-block vs
- * inside a prelude vs inside a declaration value) so the same `{` /
- * `}` / `;` token dispatches to the right enter/leave event.
- *
- * Not a spec-complete parser — `:import("…")` qualified rules with
- * declarations inside are still recognized as qualified rules; the
- * visitor doesn't see anything below the declaration value boundary.
- * It's sufficient for the benchmark, which only cares about the
- * three top-level event kinds.
+ * One-pass CSS walker. Holds the source, a `LocConverter`, and a
+ * visitor; reuses `walkCssTokens`'s public parse helpers for the
+ * individual rule/declaration heads and recurses into block bodies
+ * itself (no `parseASimpleBlock` to consume the body as flat tokens
+ * and then re-walk it). The visitor receives the same AST node
+ * objects the lazy walker produces.
  */
 class OnePassParser {
 	/**
 	 * @param {string} input CSS source
+	 * @param {{ get(pos: number): { line: number, column: number } }} locConverter loc converter (real or stub)
 	 * @param {{
-	 * enterRule?: (start: number) => void,
-	 * leaveRule?: (end: number) => void,
-	 * enterAtRule?: (nameStart: number, nameEnd: number) => void,
-	 * leaveAtRule?: (end: number) => void,
-	 * enterDeclaration?: (nameStart: number, nameEnd: number) => void,
-	 * leaveDeclaration?: (end: number) => void,
+	 * enterAtRule?: (at: unknown) => void,
+	 * leaveAtRule?: (at: unknown) => void,
+	 * enterQualifiedRule?: (rule: unknown) => void,
+	 * leaveQualifiedRule?: (rule: unknown) => void,
+	 * enterDeclaration?: (decl: unknown) => void,
+	 * leaveDeclaration?: (decl: unknown) => void,
+	 * comment?: (input: string, start: number, end: number) => number,
 	 * }} visitor visitor
 	 */
-	constructor(input, visitor) {
+	constructor(input, locConverter, visitor) {
 		this.input = input;
+		this.locConverter = locConverter;
 		this.visitor = visitor;
-		/** @type {{ mode: number, nameStart: number, nameEnd: number, isAtRule: boolean }[]} */
-		this.stack = [];
-		this.mode = T_TOP;
-		this.preludeStart = 0;
-		this.atNameStart = -1;
-		this.atNameEnd = -1;
-		this.declNameStart = -1;
-		this.declNameEnd = -1;
-		this.balanced = 0;
 	}
 
 	/**
-	 * Drive the loop. Each token mutates `mode` / dispatches the
-	 * appropriate visitor event. No AST objects are allocated; we
-	 * pass source positions to the visitor directly.
+	 * Walk the whole stylesheet, firing visitor events in source order.
 	 * @returns {void}
 	 */
 	parse() {
+		this._walkBlock(0);
+	}
+
+	/**
+	 * Walk the contents of a block (`pos` should be just past the
+	 * opening `{`, or `0` for the top-level stylesheet). Returns the
+	 * position of the closing `}` (not consumed) or `input.length`
+	 * for the top-level call.
+	 * @param {number} startPos start position (just past `{` or 0 for top level)
+	 * @returns {number} position at the closing `}` (or input.length at top level)
+	 */
+	_walkBlock(startPos) {
 		const input = this.input;
+		const locConverter = this.locConverter;
 		const visitor = this.visitor;
-		let preludeNameStart = -1;
-		let preludeNameEnd = -1;
-		let isAtRulePrelude = false;
-		for (const t of walkCssTokens(input, 0)) {
-			const type = t.type;
-			if (type === "whitespace" || type === "comment") continue;
-			if (this.mode === T_TOP || this.mode === T_BLOCK) {
-				if (type === "atKeyword") {
-					this.mode = T_PRELUDE;
-					preludeNameStart = t.start;
-					preludeNameEnd = t.end;
-					isAtRulePrelude = true;
+		const comment = visitor.comment;
+		let pos = startPos;
+		while (pos < input.length) {
+			// Same item-boundary handling `parseABlocksContents` uses:
+			// skip whitespace + comments, then any stray `;`s.
+			pos = walkCssTokens.eatWhitespaceAndComments(input, pos)[0];
+			while (pos < input.length && input.charCodeAt(pos) === CC_SEMICOLON_OPP) {
+				pos++;
+				pos = walkCssTokens.eatWhitespaceAndComments(input, pos)[0];
+			}
+			if (pos >= input.length) break;
+			// `}` closes the enclosing block — let the caller consume it.
+			if (input.charCodeAt(pos) === CC_RIGHT_CURLY_OPP) return pos;
+
+			// At-rule. `parseAtRule` consumes the prelude only (it
+			// returns at the `{` or `;`), so we can fire `enterAtRule`,
+			// recurse into the body, then `leaveAtRule` — no body
+			// re-parse needed.
+			if (input.charCodeAt(pos) === CC_AT_SIGN) {
+				const at = walkCssTokens.parseAtRule(input, pos, locConverter, comment);
+				if (!at) {
+					pos++;
 					continue;
 				}
-				if (type === "rightCurlyBracket") {
-					if (this.mode === T_BLOCK) {
-						const frame = this.stack.pop();
-						this.mode = this.stack.length === 0 ? T_TOP : T_BLOCK;
-						if (frame) {
-							if (frame.isAtRule) {
-								if (visitor.leaveAtRule) visitor.leaveAtRule(t.end);
-							} else if (visitor.leaveRule) {
-								visitor.leaveRule(t.end);
-							}
-						}
-					}
-					continue;
+				if (visitor.enterAtRule) visitor.enterAtRule(at);
+				if (at.terminator === "{") {
+					// at.end points at the `{` — recurse just past it.
+					const bodyEnd = this._walkBlock(at.end + 1);
+					// Consume the `}` and patch the AtRule's end so
+					// downstream consumers see the full span.
+					pos =
+						bodyEnd < input.length &&
+						input.charCodeAt(bodyEnd) === CC_RIGHT_CURLY_OPP
+							? bodyEnd + 1
+							: bodyEnd;
+					at.end = pos;
+				} else if (at.terminator === ";") {
+					pos = at.end + 1;
+				} else {
+					pos = at.end;
 				}
-				if (type === "semicolon") continue;
-				// Anything else opens a qualified-rule prelude.
-				this.mode = T_PRELUDE;
-				preludeNameStart = t.start;
-				preludeNameEnd = t.end;
-				isAtRulePrelude = false;
-				// Identifier in block-content context might also be a
-				// declaration property name. We can't distinguish until
-				// we see `:` vs `{`. Track it.
-				if (
-					(this.mode === T_PRELUDE || this.mode === T_BLOCK) &&
-					type === "identifier"
-				) {
-					this.declNameStart = t.start;
-					this.declNameEnd = t.end;
+				if (visitor.leaveAtRule) visitor.leaveAtRule(at);
+				continue;
+			}
+
+			// Try a declaration first (`parseADeclaration` returns
+			// `undefined` when the head doesn't look like one — fall
+			// through to a qualified rule).
+			const decl = walkCssTokens.parseADeclaration(
+				input,
+				pos,
+				locConverter,
+				comment
+			);
+			if (decl) {
+				if (visitor.enterDeclaration) visitor.enterDeclaration(decl);
+				if (visitor.leaveDeclaration) visitor.leaveDeclaration(decl);
+				pos = decl.end;
+				if (pos < input.length && input.charCodeAt(pos) === CC_SEMICOLON_OPP) {
+					pos++;
 				}
 				continue;
 			}
-			if (this.mode === T_PRELUDE) {
-				if (type === "leftParenthesis" || type === "function") {
-					this.balanced++;
-					continue;
+
+			// Qualified rule. `parseAQualifiedRule` itself consumes
+			// the body via `parseASimpleBlock` and we want the body
+			// walked by *us* (no flat-tokens-then-re-parse). Replicate
+			// its prelude parse with `parseAListOfComponentValues`,
+			// mirroring the `stopAtLeftCurly` / `stopAtRightCurly`
+			// flags.
+			const head = walkCssTokens.parseAListOfComponentValues(
+				input,
+				pos,
+				locConverter,
+				{
+					stopAtLeftCurly: true,
+					stopAtRightCurly: true,
+					comment
 				}
-				if (type === "rightParenthesis") {
-					if (this.balanced > 0) this.balanced--;
-					continue;
-				}
-				if (this.balanced > 0) continue;
-				if (type === "semicolon" && isAtRulePrelude) {
-					// `;`-terminated at-rule (e.g. `@import`).
-					if (visitor.enterAtRule) {
-						visitor.enterAtRule(preludeNameStart, preludeNameEnd);
-					}
-					if (visitor.leaveAtRule) visitor.leaveAtRule(t.end);
-					this.mode = this.stack.length === 0 ? T_TOP : T_BLOCK;
-					continue;
-				}
-				if (type === "leftCurlyBracket") {
-					if (isAtRulePrelude) {
-						if (visitor.enterAtRule) {
-							visitor.enterAtRule(preludeNameStart, preludeNameEnd);
-						}
-						this.stack.push({
-							mode: this.mode,
-							nameStart: preludeNameStart,
-							nameEnd: preludeNameEnd,
-							isAtRule: true
-						});
-					} else {
-						if (visitor.enterRule) visitor.enterRule(preludeNameStart);
-						this.stack.push({
-							mode: this.mode,
-							nameStart: preludeNameStart,
-							nameEnd: preludeNameEnd,
-							isAtRule: false
-						});
-					}
-					this.mode = T_BLOCK;
-					continue;
-				}
-				if (type === "colon" && !isAtRulePrelude && this.declNameStart >= 0) {
-					// In a block-content prelude, a `:` after a leading
-					// ident promotes the prelude to a declaration head
-					// (the `{`-vs-`;` ambiguity resolves toward `;`).
-					if (visitor.enterDeclaration) {
-						visitor.enterDeclaration(this.declNameStart, this.declNameEnd);
-					}
-					this.mode = T_DECL_VALUE;
-					continue;
-				}
+			);
+			if (head.end <= pos) {
+				pos++;
 				continue;
 			}
-			if (this.mode === T_DECL_VALUE) {
-				if (type === "leftParenthesis" || type === "function") {
-					this.balanced++;
-					continue;
-				}
-				if (type === "rightParenthesis") {
-					if (this.balanced > 0) this.balanced--;
-					continue;
-				}
-				if (this.balanced > 0) continue;
-				if (type === "semicolon" || type === "rightCurlyBracket") {
-					if (visitor.leaveDeclaration) visitor.leaveDeclaration(t.start);
-					this.declNameStart = -1;
-					this.declNameEnd = -1;
-					if (type === "rightCurlyBracket") {
-						const frame = this.stack.pop();
-						this.mode = this.stack.length === 0 ? T_TOP : T_BLOCK;
-						if (frame) {
-							if (frame.isAtRule) {
-								if (visitor.leaveAtRule) visitor.leaveAtRule(t.end);
-							} else if (visitor.leaveRule) {
-								visitor.leaveRule(t.end);
-							}
-						}
-					} else {
-						this.mode = this.stack.length === 0 ? T_TOP : T_BLOCK;
-					}
-					continue;
-				}
+			const rule = {
+				type: "qualified-rule",
+				prelude: head.values,
+				block: null,
+				start: pos,
+				end: head.end
+			};
+			if (head.terminator !== "{") {
+				if (visitor.enterQualifiedRule) visitor.enterQualifiedRule(rule);
+				if (visitor.leaveQualifiedRule) visitor.leaveQualifiedRule(rule);
+				pos = head.end;
+				continue;
 			}
+			// Body recursion. Stash a SimpleBlock-shaped object on
+			// `rule.block` so visitors see the same shape
+			// `parseAStylesheet` produces (just `start`/`end` — the
+			// values array stays empty since body items go straight
+			// to the visitor, not into an AST array).
+			rule.block = {
+				type: "simple-block",
+				token: "{",
+				start: head.end,
+				end: head.end + 1,
+				value: []
+			};
+			if (visitor.enterQualifiedRule) visitor.enterQualifiedRule(rule);
+			const bodyEnd = this._walkBlock(head.end + 1);
+			pos =
+				bodyEnd < input.length &&
+				input.charCodeAt(bodyEnd) === CC_RIGHT_CURLY_OPP
+					? bodyEnd + 1
+					: bodyEnd;
+			rule.block.end = pos;
+			rule.end = pos;
+			if (visitor.leaveQualifiedRule) visitor.leaveQualifiedRule(rule);
 		}
+		return pos;
 	}
 }
 
@@ -361,18 +358,18 @@ class OnePassParser {
  */
 const onePass = (source, counts) => {
 	const visitor = {
-		enterRule() {
-			counts.qualifiedRules++;
-			counts.enter++;
-		},
-		leaveRule() {
-			counts.leave++;
-		},
 		enterAtRule() {
 			counts.atRules++;
 			counts.enter++;
 		},
 		leaveAtRule() {
+			counts.leave++;
+		},
+		enterQualifiedRule() {
+			counts.qualifiedRules++;
+			counts.enter++;
+		},
+		leaveQualifiedRule() {
 			counts.leave++;
 		},
 		enterDeclaration() {
@@ -383,7 +380,7 @@ const onePass = (source, counts) => {
 			counts.leave++;
 		}
 	};
-	new OnePassParser(source, visitor).parse();
+	new OnePassParser(source, NULL_LOC_CONVERTER, visitor).parse();
 };
 
 // ---------------------------------------------------------------------
