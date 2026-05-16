@@ -51,6 +51,13 @@ const SAMPLES = [
 
 const fmt = (n) => n.toLocaleString("en-US", { maximumFractionDigits: 3 });
 
+// Shared compiler-root sentinel: see the matching note in
+// `css-parser-bench-large.js` — `parser.parse` rebinds
+// `unescapeIdentifier`'s cache to `state.compilation.compiler.root`
+// per call, so reusing one root across iterations is what gives the
+// steady-state numbers.
+const SHARED_COMPILER_ROOT = {};
+
 /**
  * Build a minimal mock state for `CssParser.parse`. All dep / warning
  * sinks are arrays so the visitor work is observable but the cost is
@@ -92,7 +99,11 @@ const makeMockState = (resource) => {
 	return {
 		module,
 		current: module,
-		compilation: { fileDependencies: new Set(), contextDependencies: new Set() }
+		compilation: {
+			fileDependencies: new Set(),
+			contextDependencies: new Set(),
+			compiler: { root: SHARED_COMPILER_ROOT }
+		}
 	};
 };
 

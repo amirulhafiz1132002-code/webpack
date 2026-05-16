@@ -32,6 +32,14 @@ const TARGET_MS = Number(process.env.BENCH_MS || 5000);
 
 const fmt = (n) => n.toLocaleString("en-US", { maximumFractionDigits: 3 });
 
+// Shared compiler-root sentinel: `parser.parse` does
+// `unescapeIdentifier.bindCache(state.compilation.compiler.root)` per
+// call, and the cache keys off the root *identity*. Re-using one
+// sentinel across iterations lets the cache amortize — the bench
+// would otherwise rebind to a fresh `{}` each iter and lose every
+// hit, mis-representing the steady-state cost of a CssParser parse.
+const SHARED_COMPILER_ROOT = {};
+
 /**
  * Build a minimal mock state for `CssParser.parse`. Identical to the
  * matrix bench's mock — addDep callbacks are no-ops so they're not on
@@ -70,7 +78,8 @@ const makeMockState = (resource) => {
 		current: mod,
 		compilation: {
 			fileDependencies: new Set(),
-			contextDependencies: new Set()
+			contextDependencies: new Set(),
+			compiler: { root: SHARED_COMPILER_ROOT }
 		}
 	};
 };
