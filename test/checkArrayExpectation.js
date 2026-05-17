@@ -2,6 +2,7 @@
 
 const path = require("path");
 const fs = require("graceful-fs");
+const { withKindSnapshotState } = require("./harness/snapshot");
 
 /**
  * @param {string} str string to escape for use in a RegExp
@@ -219,10 +220,14 @@ module.exports = function checkArrayExpectation(
 		}
 	} else if (array.length > 0) {
 		if (kind === "error" || kind === "warning") {
-			// Snapshot-based matching when no expectation file exists
+			// Snapshot-based matching when no expectation file exists.
+			// Uses a dedicated snap file per kind (errors.snap, warnings.snap)
+			// via withKindSnapshotState so they don't share the suite-level file.
 			try {
 				const normalized = normalizeForSnapshot(array, testDirectory);
-				expect(normalized).toMatchSnapshot(`${filename}`);
+				withKindSnapshotState(testDirectory, filename, () => {
+					expect(normalized).toMatchSnapshot(`${filename}`);
+				});
 			} catch (err) {
 				return (done(err), true);
 			}
