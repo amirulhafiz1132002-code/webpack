@@ -142,4 +142,4 @@ function execGetOutput(command, args, description) {
 	});
 }
 
-setup();
+setup(...);
